@@ -60,7 +60,11 @@ def evaluate(data_dir: Path) -> tuple[list[CategoryStats], list[dict]]:
                 "correct": flagged == (rec["label"] == "injected"),
             }
         )
-    order = ["benign", "direct", "indirect", "paraphrased"]
+    order = [
+        "benign", "direct", "indirect", "paraphrased",
+        "html-injected", "html-benign", "obfuscated", "obfuscated-benign",
+        "addressed-injected", "addressed-benign",
+    ]
     ordered = sorted(
         stats.values(),
         key=lambda s: order.index(s.category) if s.category in order else 99,
@@ -70,13 +74,13 @@ def evaluate(data_dir: Path) -> tuple[list[CategoryStats], list[dict]]:
 
 def format_table(stats: list[CategoryStats]) -> str:
     lines = [
-        f"{'category':<14}{'label':<10}{'n':>4}{'flagged/blocked':>18}{'rate':>9}",
-        "-" * 55,
+        f"{'category':<20}{'label':<10}{'n':>4}{'flagged/blocked':>18}{'rate':>9}",
+        "-" * 61,
     ]
     for s in stats:
         metric = "FPR" if s.label == "benign" else "recall"
         lines.append(
-            f"{s.category:<14}{s.label:<10}{s.total:>4}"
+            f"{s.category:<20}{s.label:<10}{s.total:>4}"
             f"{s.positive:>18}{s.rate:>8.0%}  {metric}"
         )
     return "\n".join(lines)

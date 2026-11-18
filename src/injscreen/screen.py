@@ -1,12 +1,19 @@
 """Heuristic screening for untrusted text before it enters an LLM context.
 
-The screen is deliberately simple: a set of weighted regular-expression rules
-plus two structural checks (invisible characters and instructions hidden in
-HTML comments). Each rule that matches contributes its weight once. The total
-score maps to a verdict:
+The screen combines:
 
-    score >= BLOCK_AT  -> block  (content is withheld)
-    score >= FLAG_AT   -> flag   (content is wrapped and labelled as data)
+  * weighted regular-expression rules, each counted once per text
+  * normalised views of the text (look-alikes, invisible characters, spaced
+    letters, percent/HTML entities, base64), so obfuscated phrasing is found
+  * HTML-aware hidden text (comments, invisible elements, alt/title/meta),
+    where instructions are a strong sign of injection
+  * an addressed-to-AI rule for ordinary content that speaks to the model
+
+The total score maps to a verdict using thresholds set by the trust level of
+the source:
+
+    score >= block_at  -> block  (content is withheld)
+    score >= flag_at   -> flag   (content is wrapped and labelled as data)
     otherwise          -> allow
 
 See docs/PAPER.md for the reasoning, assumptions and known limits.
@@ -17,12 +24,23 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from . import htmlscan
+from .normalize import variants
+
 ALLOW = "allow"
 FLAG = "flag"
 BLOCK = "block"
 
-FLAG_AT = 2
-BLOCK_AT = 4
+# (flag_at, block_at) by trust level of the source.
+TRUST_POLICIES: dict[str, tuple[int, int]] = {
+    "web": (2, 4),      # fetched pages: default thresholds
+    "tool": (2, 3),     # tool output: stricter, it is often machine-generated
+    "upload": (2, 3),   # user-supplied files from third parties: stricter
+    "user": (4, 6),     # the user's own input: lenient, screened mainly for logs
+}
+
+FLAG_AT = TRUST_POLICIES["web"][0]
+BLOCK_AT = TRUST_POLICIES["web"][1]
 
 _FLAGS = re.IGNORECASE | re.MULTILINE
 
@@ -107,13 +125,22 @@ RULES: tuple[Rule, ...] = (
         r"(admin|administrator|system|security team|developer)\b",
     ),
     _rule(
+        "addresses_ai",
+        2,
+        r"\b(note|message|instructions?)\s+(to|for)\s+(any\s+|the\s+)?"
+        r"(AI|LLM|assistant|chatbot|model)s?\b"
+        r"|\bif you (are|'re) an? (AI|LLM|assistant|language model)\b"
+        r"|\bAI (reading|processing|summari[sz]ing) this\b"
+        r"|\bwhen you (summari[sz]e|read|process) this\b",
+    ),
+    _rule(
         "hidden_css",
         1,
         r"display\s*:\s*none|font-size\s*:\s*0\b|visibility\s*:\s*hidden",
     ),
 )
 
-# Rules that count as "instructions" when found inside an HTML comment.
+# Rules that count as "instructions" when found in hidden text.
 _INSTRUCTION_RULES = frozenset(
     {
         "override_instructions",
@@ -124,11 +151,12 @@ _INSTRUCTION_RULES = frozenset(
         "data_exfiltration",
         "execution_coercion",
         "dangerous_command",
+        "addresses_ai",
     }
 )
+_INSTRUCTION_RULE_OBJS = tuple(r for r in RULES if r.name in _INSTRUCTION_RULES)
 
 _INVISIBLE = re.compile("[​-‏‪-‮⁠⁦-⁩﻿]")
-_HTML_COMMENT = re.compile(r"<!--(.*?)-->", re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -137,34 +165,48 @@ class Result:
     score: int
     verdict: str
     signals: tuple[str, ...] = field(default_factory=tuple)
+    trust: str = "web"
 
 
-def screen(text: str, source: str = "unknown") -> Result:
+def screen(text: str, source: str = "unknown", trust: str = "web") -> Result:
     """Score a piece of untrusted text and return a verdict."""
-    hits: list[tuple[str, int]] = []
+    if trust not in TRUST_POLICIES:
+        raise ValueError(f"unknown trust level: {trust!r}")
+    flag_at, block_at = TRUST_POLICIES[trust]
 
-    for rule in RULES:
-        if rule.pattern.search(text):
-            hits.append((rule.name, rule.weight))
+    hits: dict[str, int] = {}
+    obfuscated = False
+
+    # The raw view runs first, so a rule that matches raw text is never
+    # recorded as an obfuscation hit.
+    for label, view in variants(text):
+        for rule in RULES:
+            if rule.name in hits:
+                continue
+            if rule.pattern.search(view):
+                hits[rule.name] = rule.weight
+                if label != "raw":
+                    obfuscated = True
+
+    if obfuscated:
+        hits["obfuscation"] = 1
 
     if _INVISIBLE.search(text):
-        hits.append(("invisible_characters", 2))
+        hits["invisible_characters"] = 2
 
-    rules_by_name = {r.name: r for r in RULES}
-    instruction_rules = [rules_by_name[n] for n in _INSTRUCTION_RULES]
-    for comment in _HTML_COMMENT.findall(text):
-        if any(r.pattern.search(comment) for r in instruction_rules):
-            hits.append(("hidden_comment_instruction", 2))
-            break
+    if htmlscan.looks_like_html(text):
+        hidden = htmlscan.split(text).hidden
+        if hidden and any(r.pattern.search(hidden) for r in _INSTRUCTION_RULE_OBJS):
+            hits["hidden_instruction"] = 2
 
-    score = sum(weight for _, weight in hits)
-    if score >= BLOCK_AT:
+    score = sum(hits.values())
+    if score >= block_at:
         verdict = BLOCK
-    elif score >= FLAG_AT:
+    elif score >= flag_at:
         verdict = FLAG
     else:
         verdict = ALLOW
-    return Result(source, score, verdict, tuple(name for name, _ in hits))
+    return Result(source, score, verdict, tuple(hits), trust)
 
 
 def wrap(text: str, result: Result) -> str:
